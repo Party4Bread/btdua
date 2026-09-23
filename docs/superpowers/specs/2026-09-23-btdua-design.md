@@ -8,6 +8,10 @@ space, compression ratio, snapshots) plus in-UI actions (delete, export).
 
 Invocation: `sudo btdua <path>` — analyzes the btrfs filesystem containing
 `<path>`; the browsed tree is rooted at the filesystem's top level (subvolid 5).
+If `<path>` is not the top-level subvolume root, btdua unshares its mount
+namespace and privately mounts the device with `subvolid=5` on a temporary
+directory, so every subvolume is reachable and nothing leaks into the
+system mount table.
 
 ## Measurement: statistical sampling
 
@@ -18,17 +22,19 @@ Invocation: `sudo btdua <path>` — analyzes the btrfs filesystem containing
    chunk length), giving a logical offset.
 3. Resolve:
    - METADATA / SYSTEM chunk → bucket `<METADATA>` / `<SYSTEM>`.
-   - DATA chunk → `BTRFS_IOC_LOGICAL_INO_V2` (with `IGNORE_OFFSET` flag) →
-     list of (inode, offset, root). If the offset is not inside any extent
-     (free space in the chunk) → `<UNUSED>`. For each (root, inode), resolve
+   - DATA chunk → `BTRFS_IOC_LOGICAL_INO_V2` (no `IGNORE_OFFSET`, so only
+     references covering that exact byte count) → list of (inode, file
+     offset, root). `ENOENT` (no extent at that byte) → `<UNUSED>`;
+     extent exists but no reference covers the byte → `<UNREACHABLE>`. For each (root, inode), resolve
      paths with `BTRFS_IOC_INO_PATHS` on an fd for that subvolume; subvolume
      path prefix comes from `BTRFS_IOC_INO_LOOKUP` / root backrefs.
    - Extent referenced but no path resolves (orphans, deleted snapshots
      pending cleanup) → `<UNREACHABLE>`.
    - ioctl errors → `<ERROR>/<errno name>`.
-4. Compression: look up the extent item's file-extent data
-   (`TREE_SEARCH_V2` on the owning root for the inode's EXTENT_DATA items near
-   the file offset) to record compression type and disk vs. ram bytes.
+4. Compression: for the representative owner, search its EXTENT_DATA
+   items with key offset in `[file_offset - 128 KiB, file_offset]`; a
+   matching compressed item gives disk/ram bytes. No match means the byte
+   is in an uncompressed extent (compressed extents never exceed 128 KiB).
    Failure here is non-fatal (ratio shown as `-`).
 
 Each sample is inserted into the path tree. With `N` total samples and
@@ -41,12 +47,13 @@ with a 95% interval `±1.96·sqrt(p(1-p)/N)·A`, `p = k/N`.
   path, ties broken lexicographically, preferring non-snapshot subvolumes
   as btdu does: lowest subvolume id).
 - **distributed** — sample split `1/m` across all `m` owner paths.
-- **exclusive** — counted only when the extent has exactly one owner path.
-- **shared** — counted at every owner path when `m > 1` (sum can exceed
-  total; displayed but not used for the global total).
+- **exclusive** — counted at a node when *all* owner paths of the sample
+  lie inside that node's subtree (i.e. deleting the node would free it).
+- **shared** — counted at a node when some, but not all, owner paths lie
+  inside its subtree (sum across siblings can exceed the parent).
 
-Counters propagate to ancestors (for `represented`/`exclusive`, each sample
-counts once per ancestor chain; `distributed` sums fractions).
+Counters propagate to ancestors; each sample counts at most once per node
+for represented/exclusive/shared, and `distributed` sums `1/m` fractions.
 
 ## Architecture
 
@@ -54,12 +61,12 @@ Single crate, binary `btdua`.
 
 | Module | Responsibility |
 |---|---|
-| `btrfs/` | Raw ioctl wrappers and struct decoding: tree search v2, logical_ino v2, ino_paths, ino_lookup, fs_info, snap_destroy v2. No policy. |
+| `btrfs/` | Raw ioctl wrappers and struct decoding: tree search v2, logical_ino v2, ino_paths, ino_lookup, fs_info, snap_destroy. No policy. |
 | `sampler` | Chunk map, weighted random offset, resolve to `Sample { kind, owners, compressed }`. N worker threads (default = CPU count) send samples over a crossbeam channel. |
 | `tree` | Arena-allocated path trie with interned name segments. Node counters: represented, distributed (f64), exclusive, shared, compressed/uncompressed byte sums, sample count. Special top-level buckets `<METADATA>`, `<SYSTEM>`, `<UNUSED>`, `<UNREACHABLE>`, `<ERROR>`. Nodes flagged as subvolume roots. |
 | `stats` | Counts → bytes and confidence intervals. |
 | `ui/` | ratatui + crossterm: browser, info pane, help, dialogs. |
-| `actions` | Delete file/dir, delete subvolume, JSON export/import. |
+| `actions` | Delete files/dirs/subvolumes (single or batch), exact size, JSON export/import. |
 
 Data flow: sampler threads → channel → aggregator thread (inserts into
 `Arc<RwLock<Tree>>`) → UI thread redraws ~4 Hz from the shared tree.
@@ -98,18 +105,28 @@ timestamp, version) + nested node objects with counters.
   - `→ / l / Enter` — open; `← / h / Backspace` — up
   - `s` size, `n` name, `C` count sort; `r` reverse
   - `m` cycle size mode; `p` pause/resume sampling
-  - `i` info pane; `d` delete; `e` export; `?` help; `q` quit
-- Info pane (`i`): full path, all sizes per mode with ±error, all sharing
-  owner paths seen for this node's samples (top 10 by frequency),
-  compression breakdown by algorithm, and an on-demand **exact** size
-  (`x` inside the pane) computed in a background thread by walking the
-  directory with `FIEMAP`, counting unique physical extents (compsize-style).
+  - `Space` mark/unmark entry (cursor advances); `u` clear all marks
+  - `i` info pane; `d` delete (marked entries, or the cursor entry if none
+    are marked); `e` export; `?` help; `q` quit
+- Info pane (`i`): full path, all sizes per mode with ±error, compression
+  ratio, subvolume flag, up to 5 other paths recently seen sharing extents
+  with this entry, and an on-demand **exact** size (`x` inside the pane)
+  computed in a background thread by walking the directory and reading
+  each file's EXTENT_DATA items via tree search, summing unique extents
+  (compsize-style: disk bytes, uncompressed bytes, referenced bytes).
 - Live updates: sizes refresh as samples arrive; selection is tracked by
   node id, not row index, so re-sorting never moves the cursor to a
   different entry.
-- Delete: confirmation dialog showing path and estimated size; subvolumes
-  require a second confirmation and use `SNAP_DESTROY_V2`. On success the
-  node is marked `(deleted)` and its samples are subtracted from ancestors.
+- Marks: marked rows show a `*` prefix and highlight; marks persist while
+  navigating between directories; header shows `N marked · <size>`.
+- Delete: confirmation dialog lists the targets (up to 10, then "and N
+  more") with their total estimated exclusive size; if any target is or
+  contains a subvolume a second confirmation is required. Subvolumes are
+  removed with `BTRFS_IOC_SNAP_DESTROY` (nested subvolumes first). Targets
+  are deleted sequentially in a background thread; failures are collected
+  and shown in a dialog while the rest continue. Each deleted node is
+  removed from the tree and its counters subtracted from ancestors.
+  Special `<BUCKET>` entries cannot be marked or deleted.
 - Export: prompt for file name (default `btdua-<timestamp>.json`).
 
 ## Error handling
@@ -129,4 +146,4 @@ timestamp, version) + nested node objects with counters.
 
 ## Out of scope
 
-Fuzzy search, multi-select, mouse support, remote/SSH mode, non-btrfs filesystems.
+Fuzzy search, mouse support, remote/SSH mode, non-btrfs filesystems.
