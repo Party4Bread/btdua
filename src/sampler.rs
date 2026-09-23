@@ -10,6 +10,7 @@ use std::time::Duration;
 use parking_lot::{Mutex, RwLock};
 
 use crate::btrfs::{self, Chunk, errno_name};
+use crate::fsat;
 use crate::fsopen::FsHandle;
 use crate::rng::Rng;
 use crate::tree::{Sample, Tree};
@@ -91,7 +92,7 @@ impl Resolver {
 
     fn open_subvol(&self, root: u64) -> Option<Subvol> {
         let path = self.subvol_path(root, 0)?;
-        let fd = File::open(self.fs.mount.join(&path)).ok()?;
+        let fd = fsat::open_dir_beneath(&self.fs.top, &path).ok()?;
         let (actual, _) = btrfs::ino_lookup(&fd, 0, btrfs::FIRST_FREE_OBJECTID).ok()?;
         (actual == root).then(|| Subvol { path, fd: Arc::new(fd) })
     }

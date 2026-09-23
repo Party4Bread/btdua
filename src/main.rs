@@ -2,6 +2,7 @@ mod actions;
 mod app;
 mod btrfs;
 mod export;
+mod fsat;
 mod fsopen;
 mod rng;
 mod sampler;
@@ -191,7 +192,7 @@ fn tui_loop(terminal: &mut ratatui::DefaultTerminal, meta: &Meta, tree: &RwLock<
             Action::Exact(id) => {
                 if let Some(l) = live {
                     app.exact.insert(id, ExactState::Running);
-                    let path = l.fs.mount.join(tree.read().path_of(id));
+                    let path = tree.read().path_of(id);
                     let (fs, tx) = (l.fs.clone(), bg_tx.clone());
                     thread::spawn(move || {
                         let r = actions::exact_size(&fs.top, &path).map_err(|e| e.to_string());
@@ -206,16 +207,16 @@ fn tui_loop(terminal: &mut ratatui::DefaultTerminal, meta: &Meta, tree: &RwLock<
 fn start_delete(app: &mut App, t: &Tree, live: &Live, ids: Vec<NodeId>, tx: Sender<Bg>) {
     let jobs: Vec<(NodeId, String)> = ids.into_iter().map(|id| (id, t.path_of(id))).collect();
     app.deleting += jobs.len();
-    let mount = live.fs.mount.clone();
+    let fs = live.fs.clone();
     let resolver = live.resolver.clone();
     thread::spawn(move || {
         for (id, path) in jobs {
-            let ev = match actions::delete_path(&mount.join(&path)) {
-                Ok(()) => {
-                    // Cached fds would keep resolving into the deleted subvolume.
-                    resolver.invalidate();
-                    Bg::Deleted(id)
-                }
+            let res = fsat::delete_rel(&fs.top, &path);
+            // Even a failed delete may have destroyed nested subvolumes, and
+            // cached fds would keep resolving into them.
+            resolver.invalidate();
+            let ev = match res {
+                Ok(()) => Bg::Deleted(id),
                 Err(e) => Bg::DeleteFailed(format!("/{path}: {e}")),
             };
             let _ = tx.send(ev);

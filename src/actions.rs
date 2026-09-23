@@ -1,12 +1,12 @@
-//! Filesystem-changing and expensive operations run off the UI thread.
+//! Expensive read-only operations run off the UI thread.
 
 use std::collections::HashSet;
-use std::fs::{self, File};
+use std::ffi::OsStr;
+use std::fs::File;
 use std::io;
-use std::os::unix::fs::MetadataExt;
-use std::path::Path;
 
 use crate::btrfs;
+use crate::fsat;
 
 /// Exact, compsize-style usage of a directory tree.
 #[derive(Debug, Default, Clone)]
@@ -20,67 +20,32 @@ pub struct Exact {
     pub files: u64,
 }
 
-fn is_subvol_root(md: &fs::Metadata) -> bool {
-    md.is_dir() && md.ino() == btrfs::FIRST_FREE_OBJECTID
-}
-
-/// Deletes a file, directory tree or subvolume (nested subvolumes first).
-pub fn delete_path(p: &Path) -> io::Result<()> {
-    let md = fs::symlink_metadata(p)?;
-    if is_subvol_root(&md) {
-        destroy_nested(p)?;
-        let parent = File::open(p.parent().ok_or(io::ErrorKind::InvalidInput)?)?;
-        btrfs::snap_destroy(&parent, p.file_name().ok_or(io::ErrorKind::InvalidInput)?)
-    } else if md.is_dir() {
-        for e in fs::read_dir(p)? {
-            delete_path(&e?.path())?;
-        }
-        fs::remove_dir(p)
-    } else {
-        fs::remove_file(p)
-    }
-}
-
-/// Destroys every subvolume nested anywhere below `p`, leaving other files.
-fn destroy_nested(p: &Path) -> io::Result<()> {
-    for e in fs::read_dir(p)? {
-        let e = e?;
-        if !e.file_type()?.is_dir() {
-            continue;
-        }
-        let child = e.path();
-        if is_subvol_root(&fs::symlink_metadata(&child)?) {
-            delete_path(&child)?;
-        } else {
-            destroy_nested(&child)?;
-        }
-    }
-    Ok(())
-}
-
-/// Walks `path`, summing unique extents of every regular file (compsize-style).
-pub fn exact_size(top: &File, path: &Path) -> io::Result<Exact> {
-    let (root, _) = btrfs::ino_lookup(&File::open(path)?, 0, btrfs::FIRST_FREE_OBJECTID)?;
+/// Walks `rel` below `top`, summing unique extents of every regular file
+/// (compsize-style). Never opens files, only directories.
+pub fn exact_size(top: &File, rel: &str) -> io::Result<Exact> {
+    let (parent, name) = fsat::open_parent(top, rel)?;
+    let (root, _) = btrfs::ino_lookup(&parent, 0, btrfs::FIRST_FREE_OBJECTID)?;
     let mut ex = Exact::default();
     let mut seen = HashSet::new();
-    walk(top, path, root, &mut seen, &mut ex)?;
+    walk_at(top, &parent, &name, root, &mut seen, &mut ex)?;
     Ok(ex)
 }
 
-fn walk(top: &File, p: &Path, root: u64, seen: &mut HashSet<u64>, ex: &mut Exact) -> io::Result<()> {
-    let md = fs::symlink_metadata(p)?;
-    if md.is_dir() {
-        let root = if is_subvol_root(&md) {
-            btrfs::ino_lookup(&File::open(p)?, 0, btrfs::FIRST_FREE_OBJECTID)?.0
+fn walk_at(top: &File, parent: &File, name: &OsStr, root: u64, seen: &mut HashSet<u64>, ex: &mut Exact) -> io::Result<()> {
+    let st = fsat::stat_at(parent, name)?;
+    if fsat::is_dir(&st) {
+        let dir = fsat::open_dir_at(parent, name)?;
+        let root = if fsat::is_subvol_root(&st) {
+            btrfs::ino_lookup(&dir, 0, btrfs::FIRST_FREE_OBJECTID)?.0
         } else {
             root
         };
-        for e in fs::read_dir(p)?.flatten() {
-            let _ = walk(top, &e.path(), root, seen, ex);
+        for e in fsat::entries(&dir)? {
+            let _ = walk_at(top, &dir, &e, root, seen, ex);
         }
-    } else if md.is_file() {
+    } else if fsat::is_file(&st) {
         ex.files += 1;
-        btrfs::file_extents(top, root, md.ino(), 0, u64::MAX, |fe| {
+        btrfs::file_extents(top, root, st.st_ino, 0, u64::MAX, |fe| {
             if fe.kind == 0 {
                 ex.referenced += fe.ram_bytes;
                 ex.disk += fe.ram_bytes;
@@ -96,19 +61,4 @@ fn walk(top: &File, p: &Path, root: u64, seen: &mut HashSet<u64>, ex: &mut Exact
         })?;
     }
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn deletes_plain_directory_tree() {
-        let d = std::env::temp_dir().join(format!("btdua-del-{}", std::process::id()));
-        fs::create_dir_all(d.join("a/b")).unwrap();
-        fs::write(d.join("a/b/f"), b"x").unwrap();
-        fs::write(d.join("g"), b"y").unwrap();
-        delete_path(&d).unwrap();
-        assert!(!d.exists());
-    }
 }
