@@ -38,6 +38,34 @@ impl ChunkMap {
     }
 }
 
+/// Subvolume cache whose inserts are dropped if it was invalidated after
+/// the caller started its (lock-free) lookup.
+struct Cache<V> {
+    generation: u64,
+    map: HashMap<u64, V>,
+}
+
+impl<V: Clone> Cache<V> {
+    fn new() -> Self {
+        Cache { generation: 0, map: HashMap::new() }
+    }
+
+    fn get(&self, k: u64) -> Option<V> {
+        self.map.get(&k).cloned()
+    }
+
+    fn insert(&mut self, generation: u64, k: u64, v: V) {
+        if generation == self.generation {
+            self.map.insert(k, v);
+        }
+    }
+
+    fn invalidate(&mut self) {
+        self.generation += 1;
+        self.map.clear();
+    }
+}
+
 #[derive(Clone)]
 struct Subvol {
     path: String,
@@ -46,7 +74,7 @@ struct Subvol {
 
 pub struct Resolver {
     fs: Arc<FsHandle>,
-    subvols: Mutex<HashMap<u64, Option<Subvol>>>,
+    subvols: Mutex<Cache<Option<Subvol>>>,
 }
 
 fn join_path(a: &str, b: &str) -> String {
@@ -60,20 +88,24 @@ fn join_path(a: &str, b: &str) -> String {
 
 impl Resolver {
     pub fn new(fs: Arc<FsHandle>) -> Self {
-        Resolver { fs, subvols: Mutex::new(HashMap::new()) }
+        Resolver { fs, subvols: Mutex::new(Cache::new()) }
     }
 
     /// Forgets cached subvolume paths and fds (after something was deleted).
     pub fn invalidate(&self) {
-        self.subvols.lock().clear();
+        self.subvols.lock().invalidate();
     }
 
     fn subvol(&self, root: u64) -> Option<Subvol> {
-        if let Some(s) = self.subvols.lock().get(&root) {
-            return s.clone();
-        }
+        let generation = {
+            let c = self.subvols.lock();
+            if let Some(s) = c.get(root) {
+                return s;
+            }
+            c.generation
+        };
         let s = self.open_subvol(root);
-        self.subvols.lock().insert(root, s.clone());
+        self.subvols.lock().insert(generation, root, s.clone());
         s
     }
 
@@ -226,6 +258,17 @@ mod tests {
         assert_eq!(m.pick(4), (4, 1));
         assert_eq!(m.pick(5), (1000, 4));
         assert_eq!(m.pick(14), (1009, 4));
+    }
+
+    #[test]
+    fn cache_drops_inserts_that_started_before_invalidate() {
+        let mut c = Cache::new();
+        let started = c.generation;
+        c.invalidate();
+        c.insert(started, 1, "stale");
+        assert_eq!(c.get(1), None);
+        c.insert(c.generation, 2, "fresh");
+        assert_eq!(c.get(2), Some("fresh"));
     }
 
     #[test]
