@@ -22,9 +22,10 @@ sudo btdua / --export out.json --samples 1000000
 btdua --import out.json            # browse saved results (no root needed)
 ```
 
-The whole filesystem is shown from its top level (subvolid 5). If the path you
-pass is inside a subvolume, btdua privately mounts the top level in its own
-mount namespace; nothing appears in the system mount table.
+The whole filesystem is shown from its top level (subvolid 5): btdua mounts it
+privately in its own mount namespace (read-only if your mount is), so nothing
+appears in the system mount table and no other filesystem is ever reachable
+from it.
 
 Options: `--threads N` (default: CPU count), `--seed N`, `--seconds S`.
 
@@ -66,7 +67,9 @@ overwritten extents or deleted subvolumes awaiting cleanup), `<ERROR>`.
 
 Deleting asks for confirmation, and asks twice when a target is or contains a
 subvolume. Subvolumes are destroyed with `BTRFS_IOC_SNAP_DESTROY`, nested ones
-first.
+first. Paths that are mounted on the system (such as the subvolumes behind `/`
+and `/home`), and their parents, are never deleted. Deletion never follows
+symlinks.
 
 ## Testing
 
