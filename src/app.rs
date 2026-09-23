@@ -267,6 +267,10 @@ impl App {
         match d {
             Dialog::None | Dialog::Help | Dialog::Message { .. } => Action::None,
             Dialog::Info { node } => match key.code {
+                KeyCode::Char('x') if t.is_special(node) => {
+                    self.dialog = Dialog::message("Unavailable", "Special <BUCKET> entries are not filesystem paths.");
+                    Action::None
+                }
                 KeyCode::Char('x') if self.live => {
                     self.dialog = Dialog::Info { node };
                     Action::Exact(node)
@@ -385,6 +389,16 @@ mod tests {
         assert_eq!(app.on_key(key(KeyCode::Char('y')), &t), Action::None);
         assert!(matches!(app.dialog, Dialog::Confirm { stage: 2, .. }));
         assert_eq!(app.on_key(key(KeyCode::Char('y')), &t), Action::Delete(vec![s]));
+    }
+
+    #[test]
+    fn exact_size_is_refused_for_buckets() {
+        let mut t = Tree::new();
+        t.add_sample(&Sample::bucket("<UNUSED>"));
+        let mut app = App::new(true);
+        app.on_key(key(KeyCode::Char('i')), &t);
+        assert_eq!(app.on_key(key(KeyCode::Char('x')), &t), Action::None);
+        assert!(matches!(app.dialog, Dialog::Message { .. }));
     }
 
     #[test]

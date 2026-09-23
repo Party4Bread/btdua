@@ -115,7 +115,7 @@ fn table(f: &mut Frame, area: Rect, app: &mut App, t: &Tree, meta: &Meta) {
                 cells.push(Cell::from(c.ratio().map_or("    -".into(), |r| format!("{r:>5.2}"))));
             }
             cells.push(Cell::from(bar(if max > 0.0 { v / max } else { 0.0 })));
-            cells.push(Cell::from(format!("{:>9}", fmt_count(c.represented))));
+            cells.push(Cell::from(format!("{:>11}", fmt_count(c.represented))));
             let marked = app.marks.contains(&id);
             let mut name = format!("{}{}", if marked { "* " } else { "  " }, node.name);
             if !node.children.is_empty() {
@@ -142,8 +142,8 @@ fn table(f: &mut Frame, area: Rect, app: &mut App, t: &Tree, meta: &Meta) {
         widths.extend([Constraint::Length(10), Constraint::Length(10), Constraint::Length(5)]);
         hdr.extend(["      Excl", "    Shared", "Ratio"]);
     }
-    widths.extend([Constraint::Length(BAR as u16 + 2), Constraint::Length(9), Constraint::Min(10)]);
-    hdr.extend([" Graph", "  Samples", "  Name"]);
+    widths.extend([Constraint::Length(BAR as u16 + 2), Constraint::Length(11), Constraint::Min(10)]);
+    hdr.extend([" Graph", "    Samples", "  Name"]);
     let table = Table::new(rows, widths)
         .header(Row::new(hdr).style(Style::new().bold().underlined()))
         .row_highlight_style(Style::new().reversed())
@@ -180,7 +180,9 @@ fn footer(f: &mut Frame, area: Rect, app: &App, t: &Tree, meta: &Meta) {
 fn popup(f: &mut Frame, title: &str, lines: Vec<Line>, width: u16, border: Color) {
     let area = f.area();
     let w = width.min(area.width);
-    let h = (lines.len() as u16 + 2).min(area.height);
+    let inner = w.saturating_sub(2).max(1) as usize;
+    let rows: usize = lines.iter().map(|l| l.width().max(1).div_ceil(inner)).sum();
+    let h = (rows as u16).saturating_add(2).min(area.height);
     let r = Rect { x: area.x + (area.width - w) / 2, y: area.y + (area.height - h) / 2, width: w, height: h };
     f.render_widget(Clear, r);
     let block = Block::bordered().title(format!(" {title} ")).border_style(border);

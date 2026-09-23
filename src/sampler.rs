@@ -62,6 +62,11 @@ impl Resolver {
         Resolver { fs, subvols: Mutex::new(HashMap::new()) }
     }
 
+    /// Forgets cached subvolume paths and fds (after something was deleted).
+    pub fn invalidate(&self) {
+        self.subvols.lock().clear();
+    }
+
     fn subvol(&self, root: u64) -> Option<Subvol> {
         if let Some(s) = self.subvols.lock().get(&root) {
             return s.clone();

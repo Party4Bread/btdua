@@ -62,6 +62,7 @@ enum Bg {
 
 struct Live {
     fs: Arc<FsHandle>,
+    resolver: Arc<Resolver>,
     paused: Arc<AtomicBool>,
 }
 
@@ -105,11 +106,12 @@ fn main() -> Result<()> {
     let tree = Arc::new(RwLock::new(Tree::new()));
     let threads = cli.threads.unwrap_or_else(|| thread::available_parallelism().map_or(4, |n| n.get()));
     let seed = cli.seed.unwrap_or_else(rng::time_seed);
-    let sampler = Sampler::start(Arc::new(Resolver::new(fs.clone())), map, threads, seed, tree.clone());
+    let resolver = Arc::new(Resolver::new(fs.clone()));
+    let sampler = Sampler::start(resolver.clone(), map, threads, seed, tree.clone());
     let res = match &cli.export {
         Some(out) => headless(&cli, out, meta, &tree),
         None => {
-            let live = Live { fs: fs.clone(), paused: sampler.paused.clone() };
+            let live = Live { fs: fs.clone(), resolver, paused: sampler.paused.clone() };
             run_tui(meta, tree, Some(live))
         }
     };
@@ -205,10 +207,15 @@ fn start_delete(app: &mut App, t: &Tree, live: &Live, ids: Vec<NodeId>, tx: Send
     let jobs: Vec<(NodeId, String)> = ids.into_iter().map(|id| (id, t.path_of(id))).collect();
     app.deleting += jobs.len();
     let mount = live.fs.mount.clone();
+    let resolver = live.resolver.clone();
     thread::spawn(move || {
         for (id, path) in jobs {
             let ev = match actions::delete_path(&mount.join(&path)) {
-                Ok(()) => Bg::Deleted(id),
+                Ok(()) => {
+                    // Cached fds would keep resolving into the deleted subvolume.
+                    resolver.invalidate();
+                    Bg::Deleted(id)
+                }
                 Err(e) => Bg::DeleteFailed(format!("/{path}: {e}")),
             };
             let _ = tx.send(ev);
