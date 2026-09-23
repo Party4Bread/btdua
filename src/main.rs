@@ -150,6 +150,9 @@ fn run_tui(meta: Meta, tree: Arc<RwLock<Tree>>, live: Option<Live>) -> Result<()
 fn tui_loop(terminal: &mut ratatui::DefaultTerminal, meta: &Meta, tree: &RwLock<Tree>, live: Option<&Live>) -> Result<()> {
     let (bg_tx, bg_rx) = unbounded();
     let mut app = App::new(live.is_some());
+    if let Some(l) = live {
+        app.protected = l.fs.mounted.clone();
+    }
     loop {
         for ev in bg_rx.try_iter() {
             apply_bg(&mut app, tree, ev);

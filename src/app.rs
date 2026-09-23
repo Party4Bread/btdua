@@ -99,6 +99,8 @@ pub struct App {
     pub page: usize,
     pub deleting: usize,
     pub delete_errors: Vec<String>,
+    /// Paths mounted on the running system; they and their parents are never deleted.
+    pub protected: Vec<String>,
 }
 
 fn default_export_name() -> String {
@@ -124,6 +126,7 @@ impl App {
             page: 10,
             deleting: 0,
             delete_errors: Vec::new(),
+            protected: Vec::new(),
         }
     }
 
@@ -258,6 +261,19 @@ impl App {
         }
         let all = targets.clone();
         targets.retain(|&id| !all.iter().any(|&a| t.is_ancestor(a, id)));
+        let blocked: Vec<String> = targets
+            .iter()
+            .map(|&id| t.path_of(id))
+            .filter(|p| self.protected.iter().any(|m| m == p || m.starts_with(&format!("{p}/"))))
+            .collect();
+        if !blocked.is_empty() {
+            let list: Vec<String> = blocked.iter().map(|p| format!("  /{p}")).collect();
+            self.dialog = Dialog::message(
+                "Refusing to delete",
+                format!("These are, or contain, paths mounted on this system:\n{}", list.join("\n")),
+            );
+            return;
+        }
         if !targets.is_empty() {
             self.dialog = Dialog::Confirm { targets, stage: 1 };
         }
@@ -389,6 +405,27 @@ mod tests {
         assert_eq!(app.on_key(key(KeyCode::Char('y')), &t), Action::None);
         assert!(matches!(app.dialog, Dialog::Confirm { stage: 2, .. }));
         assert_eq!(app.on_key(key(KeyCode::Char('y')), &t), Action::Delete(vec![s]));
+    }
+
+    #[test]
+    fn mounted_subvolumes_and_their_parents_cannot_be_deleted() {
+        let mut t = Tree::new();
+        for p in ["@/etc/x", "@home/u/f", "data/f"] {
+            t.add_sample(&Sample { owners: vec![p.into()], ..Default::default() });
+        }
+        let mut app = App::new(true);
+        app.protected = vec!["@".into(), "@home/u".into()];
+        for p in ["@", "@home", "data"] {
+            app.marks.insert(t.find(p).unwrap());
+        }
+        app.on_key(key(KeyCode::Char('d')), &t);
+        assert!(matches!(&app.dialog, Dialog::Message { text, .. } if text.contains("/@home")));
+        // Files inside a mounted subvolume are fine.
+        let mut app = App::new(true);
+        app.protected = vec!["@".into()];
+        app.marks.insert(t.find("@/etc").unwrap());
+        app.on_key(key(KeyCode::Char('d')), &t);
+        assert!(matches!(app.dialog, Dialog::Confirm { .. }));
     }
 
     #[test]
