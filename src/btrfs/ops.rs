@@ -47,8 +47,31 @@ pub struct InodeRef {
 
 const MAX_LOGICAL_BUF: usize = 16 << 20;
 
+#[derive(Debug, PartialEq)]
+pub struct LogicalRefs {
+    pub refs: Vec<InodeRef>,
+    /// The kernel had more references than fit in the largest buffer.
+    pub truncated: bool,
+}
+
+fn decode_refs(buf: &[u8]) -> LogicalRefs {
+    let cnt = rd_u32(buf, 8) as usize;
+    let refs = (0..cnt / 3)
+        .map(|i| {
+            let p = 16 + i * 24;
+            InodeRef { inum: rd_u64(buf, p), offset: rd_u64(buf, p + 8), root: rd_u64(buf, p + 16) }
+        })
+        .collect();
+    let truncated = rd_u32(buf, 4) > 0 || rd_u32(buf, 12) > 0;
+    LogicalRefs { refs, truncated }
+}
+
 /// References covering exactly byte `logical`. `Err(ENOENT)` means no extent there.
-pub fn logical_ino(fd: &File, logical: u64, buf: &mut Vec<u8>) -> io::Result<Vec<InodeRef>> {
+/// `buf` is scratch space; it grows as needed up to 16 MiB.
+pub fn logical_ino(fd: &File, logical: u64, buf: &mut Vec<u8>) -> io::Result<LogicalRefs> {
+    if buf.len() < 64 << 10 {
+        buf.resize(64 << 10, 0);
+    }
     loop {
         let mut args = [0u8; 56];
         wr_u64(&mut args, 0, logical);
@@ -62,13 +85,7 @@ pub fn logical_ino(fd: &File, logical: u64, buf: &mut Vec<u8>) -> io::Result<Vec
             buf.resize(want, 0);
             continue;
         }
-        let cnt = rd_u32(buf, 8) as usize;
-        return Ok((0..cnt / 3)
-            .map(|i| {
-                let p = 16 + i * 24;
-                InodeRef { inum: rd_u64(buf, p), offset: rd_u64(buf, p + 8), root: rd_u64(buf, p + 16) }
-            })
-            .collect());
+        return Ok(decode_refs(buf));
     }
 }
 
@@ -259,6 +276,26 @@ mod tests {
         b[32..36].copy_from_slice(b"a/b\0");
         b[36..38].copy_from_slice(b"c\0");
         assert_eq!(decode_paths(&b), vec!["a/b".to_string(), "c".to_string()]);
+    }
+
+    #[test]
+    fn logical_ino_tolerates_a_short_buffer() {
+        let f = File::open("/dev/null").unwrap();
+        assert!(logical_ino(&f, 0, &mut Vec::new()).is_err());
+    }
+
+    #[test]
+    fn decodes_refs_and_reports_truncation() {
+        let mut b = vec![0u8; 16 + 24];
+        wr_u32(&mut b, 8, 3); // elem_cnt: one (inum, offset, root) triple
+        wr_u64(&mut b, 16, 257);
+        wr_u64(&mut b, 24, 4096);
+        wr_u64(&mut b, 32, 5);
+        let r = decode_refs(&b);
+        assert_eq!(r.refs, vec![InodeRef { inum: 257, offset: 4096, root: 5 }]);
+        assert!(!r.truncated);
+        wr_u32(&mut b, 12, 7); // elem_missed
+        assert!(decode_refs(&b).truncated);
     }
 
     #[test]

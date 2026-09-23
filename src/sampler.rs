@@ -161,8 +161,8 @@ impl Resolver {
             let b = if flags & btrfs::BLOCK_GROUP_SYSTEM != 0 { "<SYSTEM>" } else { "<METADATA>" };
             return Sample::bucket(b);
         }
-        let refs = match btrfs::logical_ino(&self.fs.top, logical, buf) {
-            Ok(r) => r,
+        let (refs, truncated) = match btrfs::logical_ino(&self.fs.top, logical, buf) {
+            Ok(r) => (r.refs, r.truncated),
             Err(e) if e.raw_os_error() == Some(libc::ENOENT) => return Sample::bucket("<UNUSED>"),
             Err(e) => return Sample::bucket(&format!("<ERROR>/LOGICAL_INO {}", errno_name(&e))),
         };
@@ -189,6 +189,11 @@ impl Resolver {
                 Ok(_) => owners.push((u64::MAX, "<UNREACHABLE>/unlinked".into(), None)),
                 Err(e) => owners.push((u64::MAX, format!("<ERROR>/INO_PATHS {}", errno_name(&e)), None)),
             }
+        }
+        if truncated {
+            // Owners the kernel could not list still share this extent, so
+            // none of the listed paths may count it as exclusive.
+            owners.push((u64::MAX, "<ERROR>/too many owners".into(), None));
         }
         owners.sort_by(|a, b| (a.0, a.1.len(), &a.1).cmp(&(b.0, b.1.len(), &b.1)));
         owners.dedup_by(|a, b| a.1 == b.1);
