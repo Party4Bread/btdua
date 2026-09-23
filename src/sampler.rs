@@ -91,6 +91,16 @@ impl Resolver {
         Resolver { fs, subvols: Mutex::new(Cache::new()) }
     }
 
+    /// Paths of every subvolume currently linked into the filesystem.
+    pub fn subvolume_paths(&self) -> Vec<String> {
+        btrfs::subvolume_ids(&self.fs.top)
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|id| self.subvol_path(id, 0))
+            .filter(|p| !p.is_empty())
+            .collect()
+    }
+
     /// Forgets cached subvolume paths and fds (after something was deleted).
     pub fn invalidate(&self) {
         self.subvols.lock().invalidate();

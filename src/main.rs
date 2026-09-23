@@ -20,7 +20,7 @@ use anyhow::{Context, Result, bail};
 use clap::Parser;
 use crossbeam_channel::{Sender, unbounded};
 use parking_lot::RwLock;
-use ratatui::crossterm::event::{self, Event, KeyEventKind};
+use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind};
 
 use app::{Action, App, Dialog, ExactState};
 use export::Meta;
@@ -150,12 +150,19 @@ fn run_tui(meta: Meta, tree: Arc<RwLock<Tree>>, live: Option<Live>) -> Result<()
 fn tui_loop(terminal: &mut ratatui::DefaultTerminal, meta: &Meta, tree: &RwLock<Tree>, live: Option<&Live>) -> Result<()> {
     let (bg_tx, bg_rx) = unbounded();
     let mut app = App::new(live.is_some());
+    let mut subvols_checked: Option<Instant> = None;
     if let Some(l) = live {
         app.protected = l.fs.mounted.clone();
     }
     loop {
         for ev in bg_rx.try_iter() {
             apply_bg(&mut app, tree, ev);
+        }
+        if let Some(l) = live
+            && subvols_checked.is_none_or(|t| t.elapsed() > Duration::from_secs(5))
+        {
+            refresh_subvols(l, tree);
+            subvols_checked = Some(Instant::now());
         }
         {
             let t = tree.read();
@@ -167,6 +174,11 @@ fn tui_loop(terminal: &mut ratatui::DefaultTerminal, meta: &Meta, tree: &RwLock<
         let Event::Key(key) = event::read()? else { continue };
         if key.kind != KeyEventKind::Press {
             continue;
+        }
+        if let (Some(l), KeyCode::Char('d')) = (live, key.code) {
+            // Sampling may not have hit every subvolume; the delete
+            // confirmation must know about all of them.
+            refresh_subvols(l, tree);
         }
         let action = app.on_key(key, &tree.read());
         match action {
@@ -204,6 +216,14 @@ fn tui_loop(terminal: &mut ratatui::DefaultTerminal, meta: &Meta, tree: &RwLock<
                 }
             }
         }
+    }
+}
+
+fn refresh_subvols(live: &Live, tree: &RwLock<Tree>) {
+    let paths = live.resolver.subvolume_paths();
+    let mut t = tree.write();
+    for p in &paths {
+        t.mark_subvol(p);
     }
 }
 

@@ -132,14 +132,19 @@ impl Tree {
         n.subvol = subvol;
     }
 
+    /// Flags the node at `path` (created if missing) as a subvolume root.
+    pub fn mark_subvol(&mut self, path: &str) {
+        let id = self.get_or_create(path);
+        self.nodes[id as usize].subvol = true;
+    }
+
     pub fn add_sample(&mut self, s: &Sample) {
         if s.owners.is_empty() {
             return;
         }
         self.total_samples += 1;
         for sv in &s.subvols {
-            let id = self.get_or_create(sv);
-            self.nodes[id as usize].subvol = true;
+            self.mark_subvol(sv);
         }
         let leaves: Vec<NodeId> = s.owners.iter().map(|p| self.get_or_create(p)).collect();
         let m = leaves.len() as u32;
@@ -310,6 +315,17 @@ mod tests {
         assert!(!t.is_live(x));
         assert_eq!(t.node(t.find("a").unwrap()).c.represented, 1);
         assert_eq!(t.total_samples, 2);
+    }
+
+    #[test]
+    fn unsampled_subvolumes_count_for_has_subvol() {
+        let mut t = Tree::new();
+        t.add_sample(&Sample { owners: vec!["d/f".into()], ..Default::default() });
+        let d = t.find("d").unwrap();
+        assert!(!t.has_subvol(d));
+        t.mark_subvol("d/empty-snapshot");
+        assert!(t.has_subvol(d));
+        assert!(t.node(t.find("d/empty-snapshot").unwrap()).subvol);
     }
 
     #[test]

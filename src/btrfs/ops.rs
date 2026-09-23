@@ -128,6 +128,27 @@ pub fn root_backref(fd: &File, root: u64) -> io::Result<Option<(u64, u64, String
     Ok(r)
 }
 
+/// Ids of all subvolumes that are linked into the directory tree.
+pub fn subvolume_ids(fd: &File) -> io::Result<Vec<u64>> {
+    let key = SearchKey {
+        tree_id: ROOT_TREE_OBJECTID,
+        min_objectid: FIRST_FREE_OBJECTID,
+        max_objectid: u64::MAX - 256,
+        min_type: ROOT_BACKREF_KEY,
+        max_type: ROOT_BACKREF_KEY,
+        min_offset: 0,
+        max_offset: u64::MAX,
+    };
+    let mut ids = Vec::new();
+    tree_search(fd, key, |it| {
+        if it.ty == ROOT_BACKREF_KEY && ids.last() != Some(&it.objectid) {
+            ids.push(it.objectid);
+        }
+        true
+    })?;
+    Ok(ids)
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct FileExtent {
     pub file_offset: u64,
