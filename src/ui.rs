@@ -171,10 +171,13 @@ fn footer(f: &mut Frame, area: Rect, app: &App, t: &Tree, meta: &Meta) {
     );
     let style = Style::new().reversed();
     f.render_widget(Paragraph::new(left).style(style), area);
-    f.render_widget(
-        Paragraph::new("?:help  space:mark  d:delete  e:export  q:quit ").style(style).alignment(Alignment::Right),
-        area,
-    );
+    let pause = match (app.live, app.paused) {
+        (false, _) => "",
+        (true, false) => "p:pause  ",
+        (true, true) => "p:resume  ",
+    };
+    let keys = format!("?:help  space:mark  d:delete  {pause}e:export  q:quit ");
+    f.render_widget(Paragraph::new(keys).style(style).alignment(Alignment::Right), area);
 }
 
 fn popup(f: &mut Frame, title: &str, lines: Vec<Line>, width: u16, border: Color) {
@@ -317,6 +320,24 @@ mod tests {
     use super::*;
     use crate::tree::Sample;
     use ratatui::{Terminal, backend::TestBackend};
+
+    fn screen(app: &mut App, t: &Tree) -> String {
+        let meta = Meta { total_bytes: 1 << 30, ..Default::default() };
+        let mut term = Terminal::new(TestBackend::new(140, 10)).unwrap();
+        term.draw(|f| draw(f, app, t, &meta)).unwrap();
+        term.backend().buffer().content().iter().map(|c| c.symbol()).collect()
+    }
+
+    #[test]
+    fn footer_shows_pause_key_matching_state() {
+        let t = Tree::new();
+        let mut app = App::new(true);
+        assert!(screen(&mut app, &t).contains("p:pause"));
+        app.paused = true;
+        assert!(screen(&mut app, &t).contains("p:resume"));
+        let mut imported = App::new(false);
+        assert!(!screen(&mut imported, &t).contains("p:"));
+    }
 
     #[test]
     fn renders_at_all_sizes() {
