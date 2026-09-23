@@ -7,20 +7,25 @@ mod rng;
 mod sampler;
 mod stats;
 mod tree;
+mod ui;
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
 use clap::Parser;
+use crossbeam_channel::{Sender, unbounded};
 use parking_lot::RwLock;
+use ratatui::crossterm::event::{self, Event, KeyEventKind};
 
+use app::{Action, App, Dialog, ExactState};
 use export::Meta;
 use fsopen::FsHandle;
 use sampler::{ChunkMap, Resolver, Sampler};
-use tree::Tree;
+use tree::{NodeId, ROOT, Tree};
 
 #[derive(Parser)]
 #[command(version, about = "Sampling disk usage analyzer for btrfs")]
@@ -47,6 +52,19 @@ struct Cli {
     seed: Option<u64>,
 }
 
+/// Results from background threads.
+enum Bg {
+    Deleted(NodeId),
+    DeleteFailed(String),
+    DeleteDone,
+    Exact(NodeId, Result<actions::Exact, String>),
+}
+
+struct Live {
+    fs: Arc<FsHandle>,
+    paused: Arc<AtomicBool>,
+}
+
 fn unix_now() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs())
 }
@@ -64,8 +82,9 @@ fn raise_nofile_limit() {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
-    if cli.import.is_some() {
-        bail!("--import needs the TUI (added in a later task)");
+    if let Some(file) = &cli.import {
+        let (meta, tree) = export::read(file)?;
+        return run_tui(meta, Arc::new(RwLock::new(tree)), None);
     }
     let path = cli.path.clone().context("missing PATH (or use --import FILE)")?;
     let fs = Arc::new(FsHandle::open(&path)?);
@@ -87,8 +106,13 @@ fn main() -> Result<()> {
     let threads = cli.threads.unwrap_or_else(|| thread::available_parallelism().map_or(4, |n| n.get()));
     let seed = cli.seed.unwrap_or_else(rng::time_seed);
     let sampler = Sampler::start(Arc::new(Resolver::new(fs.clone())), map, threads, seed, tree.clone());
-    let out = cli.export.clone().context("the TUI is added in a later task; use --export FILE")?;
-    let res = headless(&cli, &out, meta, &tree);
+    let res = match &cli.export {
+        Some(out) => headless(&cli, out, meta, &tree),
+        None => {
+            let live = Live { fs: fs.clone(), paused: sampler.paused.clone() };
+            run_tui(meta, tree, Some(live))
+        }
+    };
     sampler.stop();
     res
 }
@@ -111,4 +135,115 @@ fn headless(cli: &Cli, out: &Path, mut meta: Meta, tree: &RwLock<Tree>) -> Resul
     export::write(out, &meta, &t)?;
     eprintln!("wrote {}", out.display());
     Ok(())
+}
+
+fn run_tui(meta: Meta, tree: Arc<RwLock<Tree>>, live: Option<Live>) -> Result<()> {
+    let mut terminal = ratatui::init();
+    let res = tui_loop(&mut terminal, &meta, &tree, live.as_ref());
+    ratatui::restore();
+    res
+}
+
+fn tui_loop(terminal: &mut ratatui::DefaultTerminal, meta: &Meta, tree: &RwLock<Tree>, live: Option<&Live>) -> Result<()> {
+    let (bg_tx, bg_rx) = unbounded();
+    let mut app = App::new(live.is_some());
+    loop {
+        for ev in bg_rx.try_iter() {
+            apply_bg(&mut app, tree, ev);
+        }
+        {
+            let t = tree.read();
+            terminal.draw(|f| ui::draw(f, &mut app, &t, meta))?;
+        }
+        if !event::poll(Duration::from_millis(250))? {
+            continue;
+        }
+        let Event::Key(key) = event::read()? else { continue };
+        if key.kind != KeyEventKind::Press {
+            continue;
+        }
+        let action = app.on_key(key, &tree.read());
+        match action {
+            Action::None => {}
+            Action::Quit => return Ok(()),
+            Action::TogglePause => {
+                if let Some(l) = live {
+                    l.paused.store(app.paused, Ordering::Relaxed);
+                }
+            }
+            Action::Export(name) => {
+                let t = tree.read();
+                let mut m = meta.clone();
+                m.samples = t.total_samples;
+                m.timestamp = unix_now();
+                app.dialog = match export::write(Path::new(&name), &m, &t) {
+                    Ok(()) => Dialog::message("Exported", format!("Saved to {name}")),
+                    Err(e) => Dialog::message("Export failed", format!("{e:#}")),
+                };
+            }
+            Action::Delete(ids) => {
+                if let Some(l) = live {
+                    start_delete(&mut app, &tree.read(), l, ids, bg_tx.clone());
+                }
+            }
+            Action::Exact(id) => {
+                if let Some(l) = live {
+                    app.exact.insert(id, ExactState::Running);
+                    let path = l.fs.mount.join(tree.read().path_of(id));
+                    let (fs, tx) = (l.fs.clone(), bg_tx.clone());
+                    thread::spawn(move || {
+                        let r = actions::exact_size(&fs.top, &path).map_err(|e| e.to_string());
+                        let _ = tx.send(Bg::Exact(id, r));
+                    });
+                }
+            }
+        }
+    }
+}
+
+fn start_delete(app: &mut App, t: &Tree, live: &Live, ids: Vec<NodeId>, tx: Sender<Bg>) {
+    let jobs: Vec<(NodeId, String)> = ids.into_iter().map(|id| (id, t.path_of(id))).collect();
+    app.deleting += jobs.len();
+    let mount = live.fs.mount.clone();
+    thread::spawn(move || {
+        for (id, path) in jobs {
+            let ev = match actions::delete_path(&mount.join(&path)) {
+                Ok(()) => Bg::Deleted(id),
+                Err(e) => Bg::DeleteFailed(format!("/{path}: {e}")),
+            };
+            let _ = tx.send(ev);
+        }
+        let _ = tx.send(Bg::DeleteDone);
+    });
+}
+
+fn apply_bg(app: &mut App, tree: &RwLock<Tree>, ev: Bg) {
+    match ev {
+        Bg::Deleted(id) => {
+            let mut t = tree.write();
+            t.remove(id);
+            app.marks.remove(&id);
+            app.deleting = app.deleting.saturating_sub(1);
+            while !t.is_live(app.dir) {
+                app.dir = t.node(app.dir).parent.unwrap_or(ROOT);
+            }
+        }
+        Bg::DeleteFailed(msg) => {
+            app.delete_errors.push(msg);
+            app.deleting = app.deleting.saturating_sub(1);
+        }
+        Bg::DeleteDone => {
+            if app.deleting == 0 && !app.delete_errors.is_empty() {
+                let errs = std::mem::take(&mut app.delete_errors);
+                app.dialog = Dialog::message("Some deletions failed", errs.join("\n"));
+            }
+        }
+        Bg::Exact(id, r) => {
+            let state = match r {
+                Ok(e) => ExactState::Done(e),
+                Err(e) => ExactState::Failed(e),
+            };
+            app.exact.insert(id, state);
+        }
+    }
 }

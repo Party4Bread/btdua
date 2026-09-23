@@ -5,7 +5,7 @@ mod ops;
 mod search;
 
 pub use ops::*;
-pub use search::{Item, SearchKey, tree_search};
+pub use search::{SearchKey, tree_search};
 
 use std::io;
 use std::os::fd::AsRawFd;

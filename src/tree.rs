@@ -99,6 +99,7 @@ impl Tree {
         &self.nodes[id as usize]
     }
 
+    #[cfg(test)]
     pub fn find(&self, path: &str) -> Option<NodeId> {
         let mut cur = ROOT;
         for comp in path.split('/').filter(|c| !c.is_empty()) {

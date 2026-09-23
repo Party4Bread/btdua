@@ -17,7 +17,6 @@ const CHUNK_ITEM_KEY: u32 = 228;
 
 pub const BLOCK_GROUP_DATA: u64 = 1;
 pub const BLOCK_GROUP_SYSTEM: u64 = 2;
-pub const BLOCK_GROUP_METADATA: u64 = 4;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Chunk {

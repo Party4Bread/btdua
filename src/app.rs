@@ -157,6 +157,7 @@ impl App {
         }
     }
 
+    #[cfg(test)]
     pub fn current(&self, t: &Tree) -> Option<NodeId> {
         let e = self.entries(t);
         e.get(self.cursor(&e)).copied()
