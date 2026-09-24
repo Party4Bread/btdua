@@ -42,7 +42,13 @@ jobs:
 
       - name: Install cross-compilation toolchain
         if: startsWith(matrix.target, 'aarch64-')
-        run: sudo apt-get update && sudo apt-get install -y gcc-aarch64-linux-gnu
+        run: |
+          sudo apt-get update && sudo apt-get install -y gcc-aarch64-linux-gnu
+          mkdir -p .cargo
+          cat >> .cargo/config.toml <<'EOF'
+          [target.aarch64-unknown-linux-gnu]
+          linker = "aarch64-linux-gnu-gcc"
+          EOF
 
       - name: Build
         run: cargo build --release --target ${{ matrix.target }}
